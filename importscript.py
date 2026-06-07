@@ -4,6 +4,7 @@ import qrcode
 import base64 
 import asyncio
 import requests
+import aiohttp
 import logging
 import sqlite3 as sql
 import numpy as np
@@ -26,6 +27,8 @@ from mnemonic import Mnemonic
 from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
 
+from random import choice
+from string import ascii_letters, digits
 from solders.hash import Hash
 from solders.keypair import Keypair
 from solders.message import MessageV0

@@ -14,11 +14,18 @@ logging.basicConfig(filename= filename, level=logging.INFO,
 api_id= os.environ["TELEGRAM_API_ID"]
 api_hash= os.environ["TELEGRAM_API_HASH"]
 bot_token= os.environ["TELEGRAM_BOT_TOKEN"]
-account_sid= os.environ["TWILIO_ACCOUNT_SID"]
-auth_token= os.environ["TWILIO_AUTH_TOKEN"]
+#account_sid= os.environ["TWILIO_ACCOUNT_SID"]
+#auth_token= os.environ["TWILIO_AUTH_TOKEN"]
 jup_api_key= os.environ["JUP_API_KEY"]
+mob_api_key= os.environ["MOB_API_KEY"]
 user_locks, user_sessions, user_clients, active_tasks= {}, {}, {}, {} # since we're using stringsessions these don't need to be persistent dbs
 slippage_dict= {}
+wallet_dict= {}
+session_name_dict= {}
+
+# for listener
+current_task= {}
+
 auth_flag= {} # maybe in the future, turn these into dbs?
 
 @contextmanager
@@ -34,16 +41,17 @@ def db_conn(path):
     finally:
         conn.close()
 
-with db_conn("userinfo.db") as db: 
-    db.execute("CREATE TABLE IF NOT EXISTS info(userID, hash, salt_auth, salt_enc, enc_key, enc_data, is_str)")
+with db_conn("userinfo.db") as db_1, db_conn("translog.db") as db_2: 
+    db_1.execute("CREATE TABLE IF NOT EXISTS info(userID, hash, salt_auth, salt_enc, enc_key, enc_data, is_str)")
+    db_2.execute("CREATE TABLE IF NOT EXISTS info(userID, token_wallet, session)")
 
 bot= TelegramClient("bot", api_id, api_hash).start(bot_token= bot_token)
 
 @bot.on(events.NewMessage(pattern=r'^/')) # to interrupt telegram functions when a user sends another function call
 async def fork(event):
     user_id= event.sender_id
-    functions= {**{"/"+ key: key for key, value in globals().items() if callable(value) and value.__module__== __name__}, "/2FA": "twoFA"} # prevent user code injection
-
+    functions= {**{"/"+ key: key for key, value in globals().items() if (callable(value) and key!= "main" and value.__module__== __name__)}, 
+                                                                                                    "/2FA": "twoFA"} # prevent user code injection
     if user_id in active_tasks:
         task= active_tasks[user_id]
         task.cancel()
@@ -55,29 +63,27 @@ async def fork(event):
     if event.text in functions:
         active_tasks[user_id]= asyncio.create_task(eval(functions[event.text]+ "(event)"))
 
-def call_wrap(url, method, retries= 15, **kwargs):
+async def call_wrap(url, method, retries= 15, **kwargs): # change to aiohttp at some point b/c highly async 
     """Wrapper for API calls."""
     for r in range(1, retries+1):
         try:
-            response= requests.request(method, url, **kwargs)
-            response.raise_for_status()
+            response= await http_session.request(method, url, raise_for_status= True, **kwargs)  
             logger.info(f"The {url} API call was successful! Params: {kwargs}") 
-
             return response
-        except requests.exceptions.HTTPError as e:
-            code= e.response.status_code
-            if 400 <= code <= 499:
-                if code== 429:
-                    logger.error(f"API calls have been rate-limited. Retry {r}", exc_info= True)
-                    time.sleep(r)
+        except aiohttp.ClientResponseError as e:
+                code= e.status
+                if 400 <= code <= 499:
+                    if code== 429:
+                        logger.error(f"API calls have been rate-limited. Retry {r}", exc_info= True)
+                        await asyncio.sleep(r)
+                        continue
+                    logger.error(f"Client side error: {e}", exc_info= True)
+                    break
+                else: 
+                    logger.error(f"Internal server error: {e}. Retry {r}", exc_info= True)
+                    await asyncio.sleep(r) # might not need this
                     continue
-                logger.error(f"Client side error: {e}", exc_info= True)
-                break
-            else: 
-                logger.error(f"Internal server error: {e}. Retry {r}", exc_info= True)
-                time.sleep(r) # might not need this
-                continue
-        except requests.exceptions.RequestException as e:
+        except aiohttp.ClientError as e:
             logger.critical(f"Request failed: {e}")
             break
         except Exception as e:
@@ -86,20 +92,20 @@ def call_wrap(url, method, retries= 15, **kwargs):
 
     return
 
-def find_price(num_tokens, mint):
+async def find_price(num_tokens, mint):
     """Find the price of a token in USD."""
     token_base_url= "https://api.jup.ag/tokens/v2/"
     #price_response= requests.get(token_base_url+ "search", headers= {"x-api-key": jup_api_key}, params= {"query": mint}).json()
 
-    price_response= call_wrap(token_base_url+ "search", "get", headers= {"x-api-key": jup_api_key}, params= {"query": mint}).json()
+    price_response= await call_wrap(token_base_url+ "search", "get", headers= {"x-api-key": jup_api_key}, params= {"query": mint}).json()
 
     return num_tokens* price_response[0]["usdPrice"]
 
-def decimals(mint):
+async def decimals(mint):
     """Find out how many decimals are in the base token."""
     sol_url= "https://api.mainnet.solana.com"
     
-    sol_response= call_wrap(sol_url, "post", headers= {"Content-type": "application/json"}, json= {"jsonrpc": "2.0",
+    sol_response= await call_wrap(sol_url, "post", headers= {"Content-type": "application/json"}, json= {"jsonrpc": "2.0",
                                                                                                 "id": 1,
                                                                                                 "method": "getTokenSupply",
                                                                                                 "params": [mint]}).json()
@@ -107,13 +113,14 @@ def decimals(mint):
     logger.info(sol_response)
     return float("1"+ "".join(["0" for _ in range(sol_response["result"]["value"]["decimals"])]))
 
-def transaction(input_mint, output_mint, num, slippage, **kwargs):
+async def transaction(input_mint, output_mint, num, slippage, **kwargs):
     """Execute a token transaction."""
     base_url= "https://api.jup.ag/swap/v2/"
+    x= SimpleNamespace(**kwargs)
     
-    order_response= call_wrap(base_url+ "order", "get", headers= {"x-api-key": jup_api_key}, params= {"inputMint": input_mint,
+    order_response= await call_wrap(base_url+ "order", "get", headers= {"x-api-key": jup_api_key}, params= {"inputMint": input_mint,
                                                                                "outputMint": output_mint,
-                                                                               "taker": kwargs["my_pub_key"],
+                                                                               "taker": x.my_pub_key,
                                                                                "amount": num, # amount of sol to use to buy the token
                                                                                **({"slippageBps": slippage} if slippage is not None else {})}).json()
     swap_instruction= order_response["transaction"]
@@ -121,10 +128,10 @@ def transaction(input_mint, output_mint, num, slippage, **kwargs):
     lastValidBlockHeight= order_response["lastValidBlockHeight"]
 
     raw_tx= VersionedTransaction.from_bytes(base64.b64decode(swap_instruction))
-    signed_tx= VersionedTransaction(raw_tx.message, [kwargs["wallet"]])
+    signed_tx= VersionedTransaction(raw_tx.message, [x.wallet])
     encoded_tx= base64.b64encode(bytes(signed_tx)).decode()
     
-    execute_response= call_wrap(base_url+ "execute", "post", headers= {"x-api-key": jup_api_key}, json= {"signedTransaction": encoded_tx, 
+    execute_response= await call_wrap(base_url+ "execute", "post", headers= {"x-api-key": jup_api_key}, json= {"signedTransaction": encoded_tx, 
                                                                                                     "requestId": requestId,
                                                                                                     "lastValidBlockHeight": lastValidBlockHeight}).json()
     
@@ -136,34 +143,49 @@ def transaction(input_mint, output_mint, num, slippage, **kwargs):
     
     return
 
-def order_flow(sol_mint, token_mint, slippage, num, tp, sl, pubkey, wallet, wait= np.inf):
+async def order_flow(stop_event, wait= 300, **kwargs):
     """The current transaction flow for all interpreters."""
-    lamport, token_scale= decimals(sol_mint), decimals(token_mint)
+    x= SimpleNamespace(**kwargs)
 
-    bought= transaction(sol_mint, token_mint, str(ceil(num* lamport)), slippage, my_pub_key= pubkey, wallet= wallet)
+    try:
+        lamport, token_scale= await decimals(x.sol_mint), await decimals(x.token_mint)
 
-    spent_sol= float(bought["inputAmountResult"])
-    got_token= float(bought["outputAmountResult"])
-    initial_usd_token= find_price(got_token/ token_scale, token_mint)
-    total_time= time.time()+ wait
-    interval= 1.2 # internal param
+        bought= await transaction(x.sol_mint, x.token_mint, str(ceil(x.num* lamport)), x.slippage, my_pub_key= x.pubkey, wallet= x.wallet)
 
-    logger.info(f"Congrats! The transaction was a success!!! Executed at {spent_sol/ lamport} SOL or ${initial_usd_token}")
+        spent_sol= float(bought["inputAmountResult"])
+        got_token= float(bought["outputAmountResult"])
+        initial_usd_token= await find_price(got_token/ token_scale, x.token_mint)
+        total_time= time.time()+ wait
+        interval= 1.2 # internal param
 
-    while time.time()< total_time:
-        usd_token= find_price(got_token/ token_scale, token_mint)
-        pc= ((initial_usd_token/ usd_token)- 1)*100
-        if not sl< usd_token< tp:
-            logger.info(f'''The price of the token with address {token_mint[:7]}... has gone past your stop loss or take profit. You bought at {initial_usd_token} and 
+        logger.info(f"Congrats! The transaction was a success!!! Executed at {spent_sol/ lamport} SOL or ${initial_usd_token}")
+
+        while time.time()< total_time:
+            if stop_event.is_set():
+                logger.info("Trading has been stopped by the user.")
+                break
+            usd_token= await find_price(got_token/ token_scale, x.token_mint)
+            pc= ((usd_token/ initial_usd_token)- 1)*100
+            if not -x.sl<= pc<= x.tp:
+                logger.info(f'''The price of the token with address {x.token_mint[:7]}... has gone past your stop loss or take profit. You bought at {initial_usd_token} and 
                             are selling at {usd_token}. This is a percent change of {pc} (pending any slippage or fees).''')
-            _ = transaction(token_mint, sol_mint, str(int(got_token)), slippage, my_pub_key= pubkey, wallet= wallet) 
-            break
-        else:
-            logger.info(f"The amount of token with address {token_mint[:7]}... recieved is worth ${usd_token} and it has increased {pc}% from when it was bought.")
-            time.sleep(interval)
-            continue
+                _ = await transaction(x.token_mint, x.sol_mint, str(int(got_token)), x.slippage, my_pub_key= x.pubkey, wallet= x.wallet) 
+                break
+            await asyncio.sleep(interval) # to make interruptible
+            #else:
+            #    logger.info(f"The amount of token with address {x.token_mint[:7]}... recieved is worth ${usd_token} and it has increased {pc}% from when it was bought.")
+            #    await asyncio.sleep(interval)
+        return
     
-    return
+    except asyncio.CancelledError:
+        try:
+            logger.info(f"Trade has been cancelled by the user. Initiating sale of {x.token_mint}...")
+            _= await transaction(x.sol_mint, x.token_mint, str(ceil(x.num* lamport)), x.slippage, my_pub_key= x.pubkey, wallet= x.wallet)
+        except Exception as e:
+            logger.error(f"Failed to sell token after cancellation: {e}", exc_info= True)
+        
+    return 
+
 
 def turn_url_into_qr(url):
     """Creates the QR code for Telegram login."""
@@ -225,7 +247,7 @@ class Interpreter:
         for key, val in kwargs.items():
             setattr(self, key, val)
     
-    def first_interpreter(self, msg= None):
+    async def first_interpreter(self, msg= None):
         logger.info("I'm interpreting!")
         try:
             if msg:
@@ -234,30 +256,39 @@ class Interpreter:
                     if match:
                         token= match.group(1)
                         logger.info(f"I will buy the token with address {token}.")
-                        order_flow(self.sol, token, self.slippage, self.amount, self.tp, self.sl, self.pubkey, self.wallet, self.wait_time)
+                        await order_flow(self.sol, token, self.slippage, self.amount, self.tp, self.sl, self.pubkey, self.wallet, self.wait_time)
         except (NameError, AttributeError):
             logger.critical("No message was passed to the interpreter!")
+        
+        with db_conn("translog.db") as db:
+            db.execute("INSERT OR IGNORE INTO info(token_wallet) VALUES (?)", (token,))
 
         return
 
-async def create_listener(queue, num_messages, **kwargs): # use a simplenamespace
+async def create_listener(user_id, num_messages, **kwargs): # the "event.sender_id" for create_listener is from the group being listened to, NOT the user like in /trade or other commands. So we must pass on from /trade
     """Create listener using an event handler to process messages one at a time."""
-    logger.info("Hi! I've started.")
+    logger.info("I've started.")
     stop_event= asyncio.Event()
+
+    if num_messages== 0:
+            await bot.send_message(user_id, "You specified 0 messages to read, so the listener will not start. Please run '/trade' again.")
+            return
 
     args= SimpleNamespace(**kwargs) # this doesn't help simplify much but it's cool
     read= 0
 
     async def inserter(event):
-        logger.info("Queued message.")
-        await queue.put(event)
-        return
-    
+        task= current_task.get(user_id)
+
+        if task and not task.done():
+            logger.info("Waiting for trade to complete before looking at another message.")
+            return
+        
+        current_task[user_id]= asyncio.create_task(listener(event))
+
     async def listener(event): 
-        logger.info("I'm listening!")
-        nonlocal read, num_messages
-        #if not isinstance(num_messages, int):
-        #    num_messages= None
+        logger.info("I'm listening.")
+        nonlocal read
 
         chosen_method= getattr(Interpreter(slippage= args.slippage, 
                                            tp= args.tp, 
@@ -266,40 +297,15 @@ async def create_listener(queue, num_messages, **kwargs): # use a simplenamespac
                                            wait_time= args.wait_time,
                                            pubkey= args.pubkey,
                                            wallet= args.wallet), args.choice)
-        chosen_method(msg= event.text)
+        await chosen_method(msg= event.text)
 
-        if num_messages== 0:
-            await bot.send_message(event.sender_id, "You specified 0 messages to read, so the listener will not start. Please run '/trade' again.")
-            args.client.remove_event_handler(inserter, events.NewMessage(chats= args.group))
-        
-        #test= event.text.splitlines()
-        #logger.info(test)
-
-        if num_messages is not None: 
-            read+= 1
-            if read >= num_messages:
-                args.client.remove_event_handler(inserter, events.NewMessage(chats= args.group))
-                stop_event.set()
+        read+= 1
+        if num_messages is not None and read>= num_messages:
+            stop_event.set()
 
         return
 
-    async def worker(): # straight from the docs cause I'm lazy
-       logger.info("I've created a worker.")
-       while True:
-            my_event= await queue.get()
-            try:
-                await listener(my_event)
-            except Exception as e:
-                logger.error(f"Listener failed: {e}", exc_info= True)
-            finally:
-                queue.task_done()
-    
-       return 
-    
-    task= asyncio.create_task(worker())
-
     args.client.add_event_handler(inserter, events.NewMessage(chats= args.group))
-
 
     if args.num_text.endswith("m"):
         await asyncio.sleep(args.num_text[:-1]*60)
@@ -310,11 +316,11 @@ async def create_listener(queue, num_messages, **kwargs): # use a simplenamespac
     
     args.client.remove_event_handler(inserter, events.NewMessage(chats= args.group))
     
-    task.cancel()
+    '''task.cancel()
     try:
         await task
     except asyncio.CancelledError:
-        pass
+        pass'''
 
     return
 
@@ -474,9 +480,84 @@ async def callback(event):
         await bot.send_message(event.sender_id, "Good choice! Jupiter typically deals with slippage well.")
         await bot.send_message(event.sender_id, "Let's do some work...")
         return 
+    
+    # options for login
+    client= user_clients[event.sender_id] # have to define it again cause of awful architecture, sorry
 
+    if event.data== b"pswd":
+        await event.delete()
+        async with bot.conversation(event.chat_id) as conv:
+            await conv.send_message("What is your phone number? Write it in E. 164 format (e.g. +12345678992 where '1' is the country code).")
+            phone= await conv.get_response()
+            login_token= await client.request_login_code(phone.text.strip())
+            await conv.send_message("A login code was sent to your phone. Please write it here. You can run '/login' again if you didn't receive it.")
+            code= await conv.get_response()
+            await client.sign_in(login_token, code)
+            
+        return
+    if event.data== b"QR":
+        await event.delete()
+        async with bot.conversation(event.chat_id) as conv:
+            qr_login= await client.qr_login()
+            qr_img= turn_url_into_qr(qr_login.url)
+            await conv.send_file(qr_img, caption="Please scan the QR code with Telegram to login. This QR code is valid for ~30 seconds. You may need to submit '/login' again if it expires.")
+            await qr_login.wait()
+            qr_img.close()
+        
+        return
 
 async def login(event): # to prevent SQLite locks
+    """Login a user to Telegram."""
+    id= event.sender_id # got tired of typing it out
+
+    if id not in user_locks:
+        user_locks[id]= asyncio.Lock()
+    
+    lock= user_locks.setdefault(id, asyncio.Lock())
+
+    async with lock:
+        if id in user_clients:
+            client= user_clients[id]
+        else:
+            session_str= user_sessions.get(id)
+            client= TelegramClient(
+                StringSession(session_str) if session_str else StringSession(),
+                api_id,
+                api_hash)
+            user_clients[id]= client
+        await client.connect()
+        if not await client.is_user_authorized():
+            async with bot.conversation(event.chat_id) as conv:
+                try:
+                    msg= await conv.send_message(id, "Please choose your login method.", 
+                                        buttons= [Button.inline("Phone Code", b"phone"), Button.inline("QR-Code", b"QR")])
+                    await conv.wait_event(events.CallbackQuery(func= lambda x: x.sender_id== id and x.message_id== msg.id))
+                except errors.SessionPasswordNeededError:
+                    await conv.send_message("2FA is enabled for this account. Please provide your password.")
+                    while True:
+                        password= await conv.get_response()
+                        try:
+                            await client.sign_in(password= password.text)
+                        except errors.PasswordHashInvalidError:
+                            await conv.send_message("Incorrect 2FA password. Please try again.")
+                            continue
+                        break
+                except asyncio.TimeoutError as e:
+                    await conv.send_message("Sorry, but the QR code has expired. Please submit '/login' again.")
+                    return
+                except Exception as e:
+                    logger.critical(f"Error occurred in '/login': {e}")
+                    await conv.send_message("Sorry, something went wrong during the login process. Please try to submit '/login' again.")
+
+        me= await client.get_me()
+        await bot.send_message(id, f"Nice! Successfully signed in to Telegram as {me.first_name} {me.last_name} ({me.username}).")
+        user_sessions[id]= client.session.save()
+
+    return
+
+
+
+'''async def login(event): # to prevent SQLite locks
     """Login a user to Telegram."""
     id= event.sender_id
 
@@ -524,7 +605,7 @@ async def login(event): # to prevent SQLite locks
                     return
         me= await client.get_me()
         await bot.send_message(id, f"Nice! Successfully signed in to Telegram as {me.first_name} {me.last_name} ({me.username}).")
-        user_sessions[id]= client.session.save()
+        user_sessions[id]= client.session.save()'''
 
 async def start(event):
     """Sends a welcome message to the user when they start the bot."""
@@ -539,6 +620,41 @@ async def twoFA(event):
         await bot.send_message(event.sender_id, "Would you like to enable 2FA?",
                                buttons=[Button.inline('Yes', b'yes_auth_2'), Button.inline('No', b'no_auth_2')])
 
+async def stats(event):
+    """Display user PnL and win rate."""
+    base_url= "https://api.mobula.io/api/"
+
+    wallet= wallet_dict.get(event.sender_id)
+    if not wallet:
+        await bot.send_message(event.sender_id, "It looks like you haven't ran the bot yet. Start trading and look at your wins (or losses)!")
+        return
+    
+    with db_conn("translog.db") as db:
+        sesh_wall= [tok for tok, session in db.execute("SELECT token_wallet, session FROM info WHERE userID= ?", 
+                                                       (event.sender_id,)) if session== session_name_dict.get(event.sender_id)]
+
+    data= requests.get(base_url+ "2/wallet/positions", headers= {"Authorization": mob_api_key}, params= {"wallet": wallet,
+                                                                                             "blockchains": "solana"}).json()["data"]
+    # test; delete when complete
+    one_address= next(trade["token"]["address"] for trade in data)
+    logger.info(f"Here is a token address: {one_address}")
+
+    # total PnL and Win rate
+    tot_pnl= [trade["realizedPnlUSD"]- trade["totalFeesPaidUSD"] for trade in data]
+    tot_win= (sum(1 for pnl in tot_pnl if pnl> 0)/ len(tot_pnl))* 100 if len(tot_pnl)> 0 else 0
+    
+    message_1= f"\033[1mOVERALL STATS:\033[0m\nPnL: {sum(tot_pnl)}\nWin Rate: {tot_win}"
+    message_2= "\033[1mSESSION STATS:\033[0m\nN/A"
+
+    if sesh_wall:
+        sesh_pnl= [trade["realizedPnlUSD"]- trade["totalFeesPaidUSD"] for trade in data 
+                                        if trade["token"]["address"] in sesh_wall]
+        sesh_win= (sum(1 for pnl in sesh_pnl if pnl> 0)/ len(sesh_pnl))* 100 if len(sesh_pnl)> 0 else 0
+        message_2= f"\033[1mSESSION STATS:\033[0m\nPnL: {sum(sesh_pnl)}\nWin Rate: {sesh_win}"
+    
+    await bot.send_message(event.sender_id, message_1+ message_2)
+    return 
+
 async def wipe(event):
     """Allows a user to erase all stored personal data."""
     await bot.send_message(event.sender_id, "This option will erase any personal data that has been stored. You will be prompted to provide another password and reenter your wallet details when you run '/trade'. Do you want to continue?",
@@ -551,10 +667,14 @@ async def trade(event):
     if not client:
         await bot.send_message(event.sender_id, "Please login to your Telegram account using '/login' before running this command.")
         return
-    with db_conn("userinfo.db") as db:
-        row_pswd= db.execute("SELECT hash, salt_auth, salt_enc, enc_key, enc_data, is_str FROM info where userID= ?", (event.sender_id,)).fetchone()
+    with db_conn("userinfo.db") as db_1, db_conn("translog.db") as db_2:
+        row_pswd= db_1.execute("SELECT hash, salt_auth, salt_enc, enc_key, enc_data, is_str FROM info where userID= ?", (event.sender_id,)).fetchone()
         user_hash, user_salt_auth, user_salt_enc, user_enc_key, user_enc_data, check= row_pswd or [None for _ in range(6)]
-        #logger.info(f"{user_hash}, {user_salt_auth}, {user_salt_enc}, {user_enc_key}, {user_enc_data}, {check}")
+        
+        sess_name= "".join([choice(ascii_letters+ digits) for _ in range(15)]) # low collision prob (birthday problem)
+        session_name_dict[event.sender_id]= sess_name
+        db_2.execute("INSERT OR IGNORE INTO info(userID, session) VALUES (?, ?)", (event.sender_id, sess_name))
+
     if not any([user_hash, user_salt_auth, user_salt_enc, user_enc_key, user_enc_data, check]):
         async with bot.conversation(event.sender_id) as conv: # Sorry for making so many different conversations
             await conv.send_message("I need your info to send transactions! First, please specify a *strong* password to use when accessing your wallet in the future.")
@@ -593,6 +713,9 @@ async def trade(event):
         delete_user_info(event)
         return
     pubkey= keypair.pubkey()
+
+    wallet_dict[event.sender_id]= pubkey
+
     await bot.send_message(event.sender_id, f"Connected to wallet with public key: {pubkey}") 
     #key_dict[event.sender_id].extend([keypair.pubkey(), secret])
     channels, channel_dict= "", {}
@@ -660,9 +783,8 @@ async def trade(event):
         msg= await conv.send_message("Would you like to set your slippage manually or allow Jupiter to automate it?",
                                buttons=[Button.inline("I'll do it", b"manual"), Button.inline("Let Jupiter handle it", b"auto")]) # have to do a wait_event here
         await conv.wait_event(events.CallbackQuery(func= lambda x: x.sender_id== event.sender_id and x.message_id== msg.id)) # wait for button logic to be completed
-    queue= asyncio.Queue()
     try:
-        await create_listener(queue, num_mess, 
+        await create_listener(event.sender_id, num_mess, 
                                     group= group, 
                                     choice= intr_text, 
                                     client= client, 
@@ -677,6 +799,21 @@ async def trade(event):
     except Exception as e:
         logger.error(f"This didn't work: {e}", exc_info= True)
     logger.info("'/trade' command was successful!")
+
+async def stop(event):
+    """Immediately stop all trading activity."""
+    task= current_task.get(event.sender_id)
+
+    if not task:
+        await bot.send_message(event.sender_id, "There are no trades happening now...")
+        return
+    
+    try:
+        task.cancel()
+        await bot.send_message(event.sender_id, "All trades have been successfully shut down.")
+    except Exception as e:
+        logger.error(f"Something went wrong with /stop: {e}")
+    
 
 async def test(event):
     """A simple test to check if the bot is working properly."""
@@ -697,6 +834,18 @@ async def test(event):
     
     logger.info("'/test' command was successful!")
 
-if __name__=="__main__":
+async def main(event):
+    """Starts the script."""
+    global http_session
     logger.info("Starting Bot...")
-    bot.run_until_disconnected()
+    http_session= aiohttp.ClientSession()
+
+    try:
+        await bot.run_until_disconnected()
+    finally:
+        await http_session.close()
+    
+    return
+
+if __name__=="__main__":
+    asyncio.run(main())
