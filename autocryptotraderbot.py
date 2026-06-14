@@ -1,5 +1,4 @@
 # bot to trade crypto based on messages received in Telegram channels
-# Next time, use a STATE DESIGN PATTERN 
 
 from importscript import *
 
