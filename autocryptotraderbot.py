@@ -1,7 +1,6 @@
 # bot to trade crypto based on messages received in Telegram channels
 # Next time, use a STATE DESIGN PATTERN 
 # change more logger messages to DEBUG
-# run on AWS Fargate
 
 from importscript import *
 
