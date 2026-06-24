@@ -8,12 +8,12 @@ from importscript import *
 date= datetime.now().strftime("%Y %m %d %I%M").split(" ")
 filename= f"mybot_{date[0]}_{date[1]}_{date[2]}.log" 
 logger = logging.getLogger(__name__)
-logging.basicConfig(filename= filename, level=logging.INFO, # you have debug messages 
+logging.basicConfig(filename= filename, level=logging.INFO,
                             filemode= "w",
                             format="%(asctime)s - %(levelname)s - %(message)s",
                             datefmt="%Y-%m-%d %H:%M:%S")
 
-handler= RotatingFileHandler(filename, maxBytes= 5e+6, backupCount= 3) # clear_space command with this?
+handler= RotatingFileHandler(filename, maxBytes= 5e+6, backupCount= 3) 
 logger.addHandler(handler)
 
 api_id= os.environ["TELEGRAM_API_ID"]
@@ -23,7 +23,7 @@ bot_token= os.environ["TELEGRAM_BOT_TOKEN"]
 #auth_token= os.environ["TWILIO_AUTH_TOKEN"]
 jup_api_key= os.environ["JUP_API_KEY"]
 mob_api_key= os.environ["MOB_API_KEY"]
-user_locks, user_sessions, user_clients, active_tasks= {}, {}, {}, {} # since we're using stringsessions these don't need to be persistent dbs
+user_locks, user_sessions, user_clients, active_tasks= {}, {}, {}, {} 
 slippage_dict= {}
 wallet_dict= {}
 session_name_dict= {}
@@ -35,9 +35,14 @@ listener_task= {}
 # for 2FA
 auth_flag= {}
 
-# param to determine how long to wait after an exit signal
+# param to determine how long to wait (s) after an exit signal
 sig_wait= 5
 
+# params to determine the storage usage (in mb) and time (s) after which old log files will be deleted from the cwd
+size_thres= 3000 # 3 gb
+time_thres= 2.16e+6 # 25 days
+
+# for main script execution
 http_session= None
 bot= TelegramClient("bot", api_id, api_hash)
 
@@ -59,9 +64,6 @@ with db_conn("userinfo.db") as db_1, db_conn("translog.db") as db_2:
     db_2.execute("CREATE TABLE IF NOT EXISTS info(userID, token_wallet, session)")
 
 def aws_config():
-    pass
-
-def sweep():
     pass
 
 @bot.on(events.NewMessage(pattern=r'^/')) # to interrupt telegram functions when a user sends another function call
@@ -916,6 +918,49 @@ async def stop(event):
 
     return
 
+async def sweep(target= "."):
+    """Deletes files once the working directory has exceeded a certain size."""
+    while True:
+        size= 0
+        size_dict= {}
+        for dirpath, _, files in os.walk(target):
+            for file in files:
+                f_obj= os.path.join(dirpath, file)
+                if not os.path.islink(f_obj):
+                    file_size= (os.path.getsize(f_obj)/ 1e6)
+                    size+= file_size
+                    if file.startswith("mybot") and file.endswith(".log"):
+                        size_dict[f_obj]= file_size
+        size_dict= dict(sorted(size_dict.items(), key= lambda x: x[1], reverse= True))
+            
+        while size>= size_thres:
+            deleted= False
+            if not size_dict:
+                logger.debug("The storage usage of the cwd is above the provided threshold, but there are no .log files to delete! Increase storage size!")
+                break
+            for file, val in list(size_dict.items()):
+                mtime= datetime.fromtimestamp(os.path.getmtime(file))
+                if (datetime.now()- mtime).total_seconds()>= time_thres:
+                    logger.info(f"I am deleting {os.path.basename(file)}. It is {val} mb.")
+                    try:
+                        os.remove(file)
+                    except Exception as e:
+                        logger.error(f"I couldn't delete the file: {e}")
+                        size_dict.pop(file, None)
+                        continue
+                    size_dict.pop(file, None)
+                    deleted= True
+                    size-= val
+                    break 
+            if not deleted:
+                logger.debug("The storage usage of the cwd is above the provided threshold, but no .log files are old enough to delete.")
+                break
+
+
+        await asyncio.sleep(300)
+    
+    return
+
 async def s_protocol(sig, event):
     """Facilitates a graceful exit."""
     if event.is_set():
@@ -948,6 +993,7 @@ async def main(): # remember not to create separate loops or else errors- keep e
     logger.info("Starting Bot...")
 
     await bot.run_until_disconnected()
+    await sweep()
     
     return
 

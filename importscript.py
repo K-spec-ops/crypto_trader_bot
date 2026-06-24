@@ -31,7 +31,7 @@ from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
 
 from random import choice
 from string import ascii_letters, digits
-from signal import SIGINT, SIGTERM
+from signal import SIGINT, SIGTERM, SIGQUIT
 from logging.handlers import RotatingFileHandler
 from solders.hash import Hash
 from solders.keypair import Keypair
