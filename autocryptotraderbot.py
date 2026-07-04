@@ -1,25 +1,54 @@
 # bot to trade crypto based on messages received in Telegram channels
-# Next time, use a STATE DESIGN PATTERN 
-# change more logger messages to DEBUG
-# run on AWS Fargate
-# just use the sender_id for the logger names.
 
 from importscript import *
 
-api_id= os.environ["TELEGRAM_API_ID"]
-api_hash= os.environ["TELEGRAM_API_HASH"]
-bot_token= os.environ["TELEGRAM_BOT_TOKEN"]
-#account_sid= os.environ["TWILIO_ACCOUNT_SID"]
-#auth_token= os.environ["TWILIO_AUTH_TOKEN"]
+def user_logger(name, filename, level):
+    """Creates a log file."""
+
+    logger= logging.getLogger(name)
+    logger.setLevel(level)
+    if logger.hasHandlers():
+        logger.handlers.clear()
+    
+    handler = logging.FileHandler(filename, mode="a")
+    formatter= logging.Formatter(fmt= "%(asctime)s - %(levelname)s - %(message)s",
+                             datefmt= "%Y-%m-%d %H:%M:%S")
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+
+    return logger
+
+uri= os.getenv("ECS_CONTAINER_METADATA_URI_V4") # fargate metadata
+logdir= "/mnt/efs/logs" if uri else "."
+
+os.makedirs(logdir, exist_ok= True)
+
+system= user_logger("system", os.path.join(logdir, "system.log"), logging.INFO)
+
+if uri:
+    metadata= requests.get(uri+ "/task", timeout= 10).json() 
+    system.info(f'''Script is running on an ECS container:
+                              CLUSTER: {metadata.get("Cluster").split("/")[-1]}
+                              SERVICE: {metadata.get("ServiceName")}
+                              LAUNCH TYPE: {metadata.get("LaunchType")}
+                              TASK ID: {metadata.get("TaskARN").split("/")[-1]}
+                              TASK STATUS: {metadata.get("KnownStatus")}
+                              LIMITS: {metadata.get("Limits")}
+                              IN-USE STORAGE: {metadata.get("EphemeralStorageMetrics").get("Utilized")} Mb
+                              RESERVED STORAGE: {metadata.get("EphemeralStorageMetrics").get("Reserved")} Mb''')
+
+telegram_api_id= os.environ["TELEGRAM_API_ID"]
+telegram_api_hash= os.environ["TELEGRAM_API_HASH"]
+telegram_bot_token= os.environ["TELEGRAM_BOT_TOKEN"]
 jup_api_key= os.environ["JUP_API_KEY"]
 mob_api_key= os.environ["MOB_API_KEY"]
+
+date= datetime.now().strftime("%Y %m %d %I%M").split(" ")
+
 user_locks, user_sessions, user_clients, active_tasks= {}, {}, {}, {} 
 slippage_dict= {}
 wallet_dict= {}
 session_name_dict= {}
-
-# for logger
-username_dict= {}
 
 # for listener
 current_task= {}
@@ -37,25 +66,7 @@ time_thres= 2.16e+6 # 25 days
 
 # for main script execution
 http_session= None
-bot= TelegramClient("bot", api_id, api_hash)
-
-date= datetime.now().strftime("%Y %m %d %I%M").split(" ")
-filename= f"mybot_{date[0]}_{date[1]}_{date[2]}_poop.log" 
-
-def user_logger(filename):
-    """Creates a log file."""
-    logger = logging.getLogger(__name__)
-    logging.basicConfig(filename= filename, level=logging.INFO,
-                            filemode= "w",
-                            format="%(asctime)s - %(levelname)s - %(message)s",
-                            datefmt="%Y-%m-%d %H:%M:%S")
-    if not logger.hasHandlers():
-        handler= RotatingFileHandler(filename, maxBytes= 5e+6, backupCount= 3) 
-        logger.addHandler(handler)
-
-    return logger
-
-system= user_logger("system.log")
+bot= TelegramClient("bot", telegram_api_id, telegram_api_hash)
 
 @contextmanager
 def db_conn(path):
@@ -74,13 +85,39 @@ with db_conn("userinfo.db") as db_1, db_conn("translog.db") as db_2:
     db_1.execute("CREATE TABLE IF NOT EXISTS info(userID, hash, salt_auth, salt_enc, enc_key, enc_data, is_str)")
     db_2.execute("CREATE TABLE IF NOT EXISTS info(userID, token_wallet, session)")
 
-def aws_config():
-    pass
+async def call_wrap(url, method, logger, retries= 15, **kwargs):  
+    """Wrapper for API calls."""
+    for r in range(1, retries+1):
+        try:
+            response= await http_session.request(method, url, raise_for_status= True, **kwargs)  
+            if r> 1:
+                logger.info(f"The {url} API call was successful! Params: {kwargs}") 
+            return response
+        except aiohttp.ClientResponseError as e:
+                code= e.status
+                if 400 <= code <= 499:
+                    if code== 429:
+                        logger.error(f"API calls have been rate-limited. Retry {r}")
+                        await asyncio.sleep(r)
+                        continue
+                    logger.critical(f"Client side error: {e}")
+                    break
+                else: 
+                    logger.error(f"Internal server error: {e}. Retry {r}")
+                    await asyncio.sleep(r) # might not need this
+                    continue
+        except aiohttp.ClientError as e:
+            logger.critical(f"Request failed: {e}")
+            break
+        except Exception as e:
+            logger.critical(f"An error unrelated to the request caused an unexpected failure: {e}")
+            break
+
+    return
 
 @bot.on(events.NewMessage(pattern=r'^/')) # to interrupt telegram functions when a user sends another function call
 async def fork(event):
     id= event.sender_id
-    retries= 5
 
     functions= {**{"/"+ key: key for key, value in globals().items() if (callable(value) and key!= "main" and value.__module__== __name__)}, 
                                                                                                     "/2FA": "twoFA"} # prevent user code injection
@@ -97,55 +134,23 @@ async def fork(event):
     
     return
 
-async def call_wrap(url, method, retries= 15, **kwargs):  
-    """Wrapper for API calls."""
-    for r in range(1, retries+1):
-        try:
-            response= await http_session.request(method, url, raise_for_status= True, **kwargs)  
-            if r> 1:
-                system.info(f"The {url} API call was successful! Params: {kwargs}") # you could also just set this to debug
-            return response
-        except aiohttp.ClientResponseError as e:
-                code= e.status
-                if 400 <= code <= 499:
-                    if code== 429:
-                        system.error(f"API calls have been rate-limited. Retry {r}")
-                        await asyncio.sleep(r)
-                        continue
-                    system.critical(f"Client side error: {e}")
-                    break
-                else: 
-                    system.error(f"Internal server error: {e}. Retry {r}")
-                    await asyncio.sleep(r) # might not need this
-                    continue
-        except aiohttp.ClientError as e:
-            system.critical(f"Request failed: {e}")
-            break
-        except Exception as e:
-            system.critical(f"An error unrelated to the request caused an unexpected failure: {e}")
-            break
-
-    return
-
-async def find_price(num_tokens, mint):
+async def find_price(num_tokens, mint, logger):
     """Find the price of a token in USD."""
     token_base_url= "https://api.jup.ag/tokens/v2/"
-    #price_response= requests.get(token_base_url+ "search", headers= {"x-api-key": jup_api_key}, params= {"query": mint}).json()
 
-    price_response= await (await call_wrap(token_base_url+ "search", "get", headers= {"x-api-key": jup_api_key}, params= {"query": mint})).json()
+    price_response= await (await call_wrap(token_base_url+ "search", "get", logger, headers= {"x-api-key": jup_api_key}, params= {"query": mint})).json()
 
     return num_tokens* price_response[0]["usdPrice"]
 
-async def decimals(mint):
+async def decimals(mint, logger):
     """Find out how many decimals are in the base token."""
     sol_url= "https://api.mainnet.solana.com"
     
-    sol_response= await (await call_wrap(sol_url, "post", headers= {"Content-type": "application/json"}, json= {"jsonrpc": "2.0",
+    sol_response= await (await call_wrap(sol_url, "post", logger, headers= {"Content-type": "application/json"}, json= {"jsonrpc": "2.0",
                                                                                                 "id": 1,
                                                                                                 "method": "getTokenSupply",
                                                                                                 "params": [mint]})).json()
     
-    logger.info(sol_response)
     return float("1"+ "".join(["0" for _ in range(sol_response["result"]["value"]["decimals"])]))
 
 async def transaction(input_mint, output_mint, num, slippage, **kwargs):
@@ -153,7 +158,9 @@ async def transaction(input_mint, output_mint, num, slippage, **kwargs):
     base_url= "https://api.jup.ag/swap/v2/"
     x= SimpleNamespace(**kwargs)
     
-    order_response= await (await call_wrap(base_url+ "order", "get", headers= {"x-api-key": jup_api_key}, params= {"inputMint": input_mint,
+    logger= x.logger
+
+    order_response= await (await call_wrap(base_url+ "order", "get", logger, headers= {"x-api-key": jup_api_key}, params= {"inputMint": input_mint,
                                                                                "outputMint": output_mint,
                                                                                "taker": x.my_pub_key,
                                                                                "amount": num, # amount of sol to use to buy the token
@@ -166,7 +173,7 @@ async def transaction(input_mint, output_mint, num, slippage, **kwargs):
     signed_tx= VersionedTransaction(raw_tx.message, [x.wallet])
     encoded_tx= base64.b64encode(bytes(signed_tx)).decode()
     
-    execute_response= await (await call_wrap(base_url+ "execute", "post", headers= {"x-api-key": jup_api_key}, json= {"signedTransaction": encoded_tx, 
+    execute_response= await (await call_wrap(base_url+ "execute", "post", logger, headers= {"x-api-key": jup_api_key}, json= {"signedTransaction": encoded_tx, 
                                                                                                     "requestId": requestId,
                                                                                                     "lastValidBlockHeight": lastValidBlockHeight})).json()
     
@@ -183,14 +190,16 @@ async def order_flow(stop_event, wait, **kwargs):
     got_token= None # protect cancellation
     x= SimpleNamespace(**kwargs)
 
-    try:
-        lamport, token_scale= await decimals(x.sol_mint), await decimals(x.token_mint)
+    logger= x.logger
 
-        bought= await transaction(x.sol_mint, x.token_mint, str(ceil(x.num* lamport)), x.slippage, my_pub_key= x.pubkey, wallet= x.wallet)
+    try:
+        lamport, token_scale= await decimals(x.sol_mint, logger), await decimals(x.token_mint, logger)
+
+        bought= await transaction(x.sol_mint, x.token_mint, str(ceil(x.num* lamport)), x.slippage, my_pub_key= x.pubkey, wallet= x.wallet, logger= logger)
 
         spent_sol= float(bought["inputAmountResult"])
         got_token= float(bought["outputAmountResult"])
-        initial_usd_token= await find_price(got_token/ token_scale, x.token_mint)
+        initial_usd_token= await find_price(got_token/ token_scale, x.token_mint, logger)
         total_time= time.time()+ (wait if wait!= 0 else np.inf)
         interval= 1.2 # internal param
 
@@ -201,18 +210,18 @@ async def order_flow(stop_event, wait, **kwargs):
         while time.time()< total_time:
             if stop_event.is_set():
                 break
-            usd_token= await find_price(got_token/ token_scale, x.token_mint)
+            usd_token= await find_price(got_token/ token_scale, x.token_mint, logger)
             pc= ((usd_token/ initial_usd_token)- 1)*100
             if not -x.sl<= pc<= x.tp:
                 logger.info(f'''The price of the token with address {x.token_mint[:7]}... has gone past your stop loss or take profit. You bought at {initial_usd_token} and 
                             are selling at {usd_token} (pending any slippage or fees). This is a percent change of {pc}.''')
-                await transaction(x.token_mint, x.sol_mint, str(int(got_token)), x.slippage, my_pub_key= x.pubkey, wallet= x.wallet) 
+                await transaction(x.token_mint, x.sol_mint, str(int(got_token)), x.slippage, my_pub_key= x.pubkey, wallet= x.wallet, logger= logger) 
                 break
             await asyncio.sleep(interval) # to make interruptible
 
         else:
             logger.info(f"Trading time of {wait} seconds has been exceeded. Selling remaining tokens...")
-            await transaction(x.token_mint, x.sol_mint, str(int(got_token)), x.slippage, my_pub_key= x.pubkey, wallet= x.wallet) 
+            await transaction(x.token_mint, x.sol_mint, str(int(got_token)), x.slippage, my_pub_key= x.pubkey, wallet= x.wallet, logger= logger) 
 
         return
     
@@ -220,7 +229,7 @@ async def order_flow(stop_event, wait, **kwargs):
         if got_token is not None:
             try:
                 logger.info(f"Trade has been cancelled by the user. Initiating sale of {x.token_mint}...")
-                await asyncio.shield(transaction(x.token_mint, x.sol_mint, str(int(got_token)), x.slippage, my_pub_key= x.pubkey, wallet= x.wallet))
+                await asyncio.shield(transaction(x.token_mint, x.sol_mint, str(int(got_token)), x.slippage, my_pub_key= x.pubkey, wallet= x.wallet, logger= logger))
             except Exception as e:
                 logger.critical(f"Failed to sell token after cancellation: {e}")
         
@@ -270,20 +279,20 @@ def turn_url_into_qr(url):
     
     return'''
 
-def send_text(phone):
+'''def send_text(phone):
     """Sends a text via SMS gateway to the user's phone."""
-    logger.info("This area is under construction.")
+    #logger.info("This area is under construction.")
 
-    '''texter= Client(account_sid, auth_token)
+    texter= Client(account_sid, auth_token)
     message= texter.messages.create(
         body= "What's good, bby girl. This is a test.",
         from_= "+19545933133",
         to= phone
     )
     
-    return'''
-
     return
+
+    return'''
 
 class Interpreter:
     """Interprets messages received from a channel and takes an action."""
@@ -293,6 +302,8 @@ class Interpreter:
             setattr(self, key, val)
     
     async def first_interpreter(self, msg= None):
+        logger= self.logger
+
         logger.info("I'm interpreting!")
         found= False
         try:
@@ -313,7 +324,8 @@ class Interpreter:
                                          pubkey= self.pubkey, 
                                          wallet= self.wallet, 
                                          wait= self.wait_time, 
-                                         id= self.id)
+                                         id= self.id,
+                                         logger= logger)
                 if not found:
                     logger.info("I don't recognize this message. Are you sure this is from the right group?")
                     
@@ -327,7 +339,6 @@ class Interpreter:
 
 async def create_listener(id, num_messages, **kwargs): # the "event.sender_id" for create_listener is from the group being listened to, NOT the user like in /trade or other commands. So we must pass on from /trade
     """Create listener using an event handler to process messages one at a time."""
-    logger.info("I've started.")
     stop_event= asyncio.Event()
 
     listener_task[id]= asyncio.current_task()
@@ -337,6 +348,10 @@ async def create_listener(id, num_messages, **kwargs): # the "event.sender_id" f
             return
 
     args= SimpleNamespace(**kwargs) # this doesn't help simplify much but it's cool
+
+    logger= args.logger
+    logger.info("I've started.")
+
     read= 0
 
     async def inserter(event):
@@ -354,9 +369,10 @@ async def create_listener(id, num_messages, **kwargs): # the "event.sender_id" f
 
         chosen_method= getattr(Interpreter(slippage= args.slippage,
                                            id= id, 
+                                           stop_event= stop_event,
+                                           logger= logger,
                                            tp= args.tp, 
                                            sl= args.sl, 
-                                           stop_event= stop_event,
                                            amount= args.amount, 
                                            wait_time= args.wait_time,
                                            pubkey= args.pubkey,
@@ -390,7 +406,7 @@ async def create_listener(id, num_messages, **kwargs): # the "event.sender_id" f
     
     return
 
-async def keypair_gen(user_input, conv):
+async def keypair_gen(user_input, conv, logger):
     logger.debug(f"The user input is {user_input}")
     #async with bot.conversation(chat_id) as conv:
     try:
@@ -471,43 +487,15 @@ def my_decrypt(password, pass_hash, salt_auth, salt_acc, enc_key, protected_data
     decrypted= f_data.decrypt(protected_data)
 
     return decrypted
-
-'''@bot.on(events.CallbackQuery)
-async def callback(event):
-    """To regulate button responses."""
-    await event.answer()
     
-    # options for 2FA
-    if event.data== b"yes_auth_1":
-        return
-    if event.data== b"no_auth_1":
-        return
-    if event.data== b"yes_auth_2":
-        await event.delete()
-        async with bot.conversation(event.sender_id) as conv:
-            await conv.send_message("Please enter your phone number without any spaces or dashes. Include your country code. (e.g. +18007132618)")
-            while True:
-                number= await conv.get_response()
-                if not number.text.split("+")[-1].isdigit():
-                    await conv.send_message("It seems like you didn't type your number correctly. Check for any mistakes and try again.")
-                    continue
-                break
-            try:
-                send_text(number)
-                #logger.info(f"Sent message {messID} to {number}")
-            except Exception as e:
-                logger.error(f"2FA error: {e}")
-                await conv.send_message("Something went wrong while trying to send a message to your phone number. Often, this is because your carrier doesn't have an SMS gateway.")
-    if event.data== b"no_auth_2":
-        await event.delete()
-        await bot.send_message(event.sender_id, "Ok. Stay safe and secure!")'''
-    
-
 async def login(event): # to prevent SQLite locks
     """Login a user to Telegram."""
 
-    id= event.sender_id # got tired of typing it out
-    logger= user_logger(id)
+    id= event.sender_id 
+    filename= f"mybot_{date[0]}_{date[1]}_{date[2]}_{id}.log"
+
+    logger= user_logger(f"user_{id}", os.path.join(logdir, filename), logging.INFO)
+    logger.info("Performing actions from '/login'...")
 
     if id not in user_locks:
         user_locks[id]= asyncio.Lock()
@@ -521,8 +509,8 @@ async def login(event): # to prevent SQLite locks
             session_str= user_sessions.get(id)
             client= TelegramClient(
                 StringSession(session_str) if session_str else StringSession(),
-                api_id,
-                api_hash)
+                telegram_api_id,
+                telegram_api_hash)
             user_clients[id]= client
         
         await client.connect()
@@ -629,31 +617,40 @@ async def login(event): # to prevent SQLite locks
             me= await client.get_me()
             await bot.send_message(id, f"Successfully signed in to Telegram as {me.username}.")
             user_sessions[id]= client.session.save()
-            username_dict[id]= me.username
 
     return
 
 async def start(event):
     """Sends a welcome message to the user when they start the bot."""
     id= event.sender_id
-    logger= user_logger(id)
+    filename= f"mybot_{date[0]}_{date[1]}_{date[2]}_{id}.log"
 
+    logger= user_logger(f"user_{id}", os.path.join(logdir, filename), logging.INFO)
     logger.info("Performing actions from '/start'...")
 
-    await bot.send_message(event.sender_id, "Hello! I am a crypto trading bot that is currently in development.") 
+    await bot.send_message(id, "Hello! I am a crypto trading bot that is currently in development.") 
 
     return
 
 async def help(event):
     """Instructs a user on actions to take when encountering an error."""
-    pass
+    id= event.sender_id
+    filename= f"mybot_{date[0]}_{date[1]}_{date[2]}_{id}.log"
+
+    logger= user_logger(f"user_{id}", os.path.join(logdir, filename), logging.INFO)
+    logger.info("Performing actions from '/help'...")
+
+    await bot.send_message(id, f"YOUR SESSION ID IS: {id}.\n\nIf you run into an error, please provide your session ID and I will try to troubleshoot the issue. Thanks!")
+
+    return
 
 # bring this back at some point
 async def twoFA(event):
     """Allows user to enable 2FA."""
     id= event.sender_id
-    logger= user_logger(id)
+    filename= f"mybot_{date[0]}_{date[1]}_{date[2]}_{id}.log"
 
+    logger= user_logger(f"user_{id}", os.path.join(logdir, filename), logging.INFO)
     logger.info("Performing actions from '/twoFA'...")
 
     await bot.send_message(id, "This area is under construction.")
@@ -669,8 +666,9 @@ async def twoFA(event):
 async def stats(event): # fix this
     """Display user PnL and win rate."""
     id= event.sender_id
-    logger= user_logger(id)
+    filename= f"mybot_{date[0]}_{date[1]}_{date[2]}_{id}.log"
 
+    logger= user_logger(f"user_{id}", os.path.join(logdir, filename), logging.INFO)
     logger.info("Performing actions from '/stats'...")
 
     base_url= "https://api.mobula.io/api/"
@@ -707,8 +705,9 @@ async def stats(event): # fix this
 async def wipe(event):
     """Allows a user to erase all stored personal data."""
     id= event.sender_id
-    logger= user_logger(id)
+    filename= f"mybot_{date[0]}_{date[1]}_{date[2]}_{id}.log"
 
+    logger= user_logger(f"user_{id}", os.path.join(logdir, filename), logging.INFO)
     logger.info("Performing actions from '/wipe'...")
     
     async with bot.conversation(event.chat_id, timeout= None) as conv:
@@ -739,9 +738,10 @@ async def wipe(event):
 async def trade(event):
     """Main trading logic."""
     id= event.sender_id
-    logger= user_logger(id)
+    filename= f"mybot_{date[0]}_{date[1]}_{date[2]}_{id}.log"
 
-    logger.info("Performing actions from command '/trade'...")
+    logger= user_logger(f"user_{id}", os.path.join(logdir, filename), logging.INFO)
+    logger.info("Performing actions from '/trade'...")
     
     client= user_clients.get(id)
     
@@ -767,7 +767,7 @@ async def trade(event):
             while True:
                 info_mes= await conv.get_response(timeout= 300)
                 try:
-                    keypair=  await keypair_gen(info_mes, conv)
+                    keypair=  await keypair_gen(info_mes, conv, logger)
                 except Exception:
                     continue
                 break 
@@ -788,7 +788,7 @@ async def trade(event):
                     continue
                 break
             try:
-                keypair= await keypair_gen(secret, conv)
+                keypair= await keypair_gen(secret, conv, logger)
             except Exception:
                 await conv.send_message("Sorry, your details couldn't be used to generate a keypair. This may be due to corruption or some other reason. Please rerun '/trade'. You will be prompted to create another password. It can be the same as the last one, but this isn't recommended.")
                 delete_user_info(event) 
@@ -799,7 +799,7 @@ async def trade(event):
             delete_user_info(event)
             return
         
-        pubkey= str(keypair.pubkey()) # used to be without str()
+        pubkey= str(keypair.pubkey())
 
         wallet_dict[id]= pubkey
 
@@ -902,6 +902,7 @@ async def trade(event):
 
     try:
         await create_listener(id, num_mess, 
+                                    logger= logger,
                                     group= group, 
                                     choice= intr_text, 
                                     client= client, 
@@ -923,9 +924,10 @@ async def trade(event):
 async def stop(event):
     """Immediately stop all trading activity."""
     id= event.sender_id
-    logger= user_logger(id)
+    filename= f"mybot_{date[0]}_{date[1]}_{date[2]}_{id}.log"
 
-    logger.info("Performing actions from command '/stop'...")
+    logger= user_logger(f"user_{id}", os.path.join(logdir, filename), logging.INFO)
+    logger.info("Performing actions from '/stop'...")
 
     kill_task= listener_task.get(id)
 
@@ -942,7 +944,7 @@ async def stop(event):
 
     return
 
-async def sweep(target= "."):
+async def sweep(target):
     """Deletes files once the working directory has exceeded a certain size."""
     while True:
         size= 0
@@ -1009,16 +1011,19 @@ async def main(): # remember not to create separate loops or else errors- keep e
 
     http_session= aiohttp.ClientSession()
     try:
-        await bot.start(bot_token= bot_token)
+        await bot.start(bot_token= telegram_bot_token)
     except ConnectionError as e:
         system.critical(f"{str(e)}, Exiting...")
         raise
     
     system.info("Starting Bot...")
 
+    sweep_task= asyncio.create_task(sweep(logdir))
+
     await bot.run_until_disconnected()
-    await sweep()
-    
+    await http_session.close()
+    sweep_task.cancel()
+
     return
 
 if __name__=="__main__":

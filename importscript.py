@@ -4,12 +4,14 @@ import qrcode
 import base64 
 import asyncio
 import aiohttp
+import requests
 import phonenumbers
 import logging
 import sqlite3 as sql
 import numpy as np
 import boto3
 import json
+import stat
 import time
 import hmac
 import re
@@ -27,7 +29,6 @@ from mnemonic import Mnemonic
 from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
 
-from flask import Flask
 from random import choice
 from string import ascii_letters, digits
 from signal import SIGINT, SIGTERM, SIGQUIT
